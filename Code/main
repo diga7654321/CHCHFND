@@ -1,0 +1,260 @@
+import os, re, json, math, random, argparse
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+from collections import defaultdict
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
+
+ZH_SPLIT_RE = re.compile(r'[。！？!?；;]\s*')
+
+def sent_split(text: str) -> List[str]:
+    return [s.strip() for s in ZH_SPLIT_RE.split(text or "") if s.strip()]
+
+def load_news_json(path: str) -> Dict[str, dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    assert isinstance(obj, dict)
+    return obj
+
+def load_hd_json(path: str) -> Dict[str, dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    assert isinstance(obj, dict)
+    return obj
+
+def get_encoder(local_dir: str):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if not os.path.isdir(local_dir):
+        raise FileNotFoundError(f"not found local encoder dir: {local_dir}")
+    return SentenceTransformer(local_dir)
+
+def sbert(model, texts: List[str]) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, model.get_sentence_embedding_dimension()))
+    return np.asarray(model.encode(texts, normalize_embeddings=True, show_progress_bar=False))
+
+@dataclass
+class Sample:
+    news_id: str
+    sents: List[str]
+    label: int
+    mask_m: np.ndarray
+    freq_u: np.ndarray
+    sent_vecs: np.ndarray
+
+class WeiboFNDataset(Dataset):
+    def __init__(self, samples: List[Sample]):
+        self.samples = samples
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx): return self.samples[idx]
+
+class HDFEClassifier(nn.Module):
+    def __init__(self, d_in=768, d_proj=256):
+        super().__init__()
+        self.proj_safe = nn.Linear(d_in, d_proj)
+        self.proj_risk = nn.Linear(d_in, d_proj)
+        self.q = nn.Parameter(torch.randn(d_proj))
+        self.beta_u = nn.Parameter(torch.tensor(0.5))
+        self.beta_m = nn.Parameter(torch.tensor(0.5))
+        self.cls = nn.Sequential(
+            nn.Linear(d_proj, d_proj),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_proj, 1)
+        )
+
+    def forward(self, sent_vecs, mask_m, freq_u):
+        proj_safe = self.proj_safe(sent_vecs)         # [B,S,P]
+        proj_risk = self.proj_risk(sent_vecs)         # [B,S,P]
+        M = mask_m.unsqueeze(-1)                      # [B,S,1]
+        Z = proj_safe*(1.0 - M) + proj_risk*M
+        q = self.q.view(1,1,-1)
+        att = (Z * q).sum(-1) + self.beta_u*freq_u - self.beta_m*mask_m
+        w = torch.softmax(att, dim=1).unsqueeze(-1)   # [B,S,1]
+        v = (Z * w).sum(1)                            # [B,P]
+        logit = self.cls(v).squeeze(-1)               # [B]
+        return logit, w.squeeze(-1)
+
+def collate(batch: List[Sample]):
+    maxS = max(len(x.sents) for x in batch)
+    D = batch[0].sent_vecs.shape[1] if batch[0].sent_vecs.size else 768
+    B = len(batch)
+    sv = np.zeros((B, maxS, D), dtype=np.float32)
+    mm = np.zeros((B, maxS), dtype=np.float32)
+    uu = np.zeros((B, maxS), dtype=np.float32)
+    y  = np.zeros((B,), dtype=np.float32)
+    ids= []
+    for i, smp in enumerate(batch):
+        S = len(smp.sents)
+        sv[i,:S,:] = smp.sent_vecs
+        mm[i,:S]   = smp.mask_m
+        uu[i,:S]   = smp.freq_u
+        y[i]       = smp.label
+        ids.append(smp.news_id)
+    return (
+        torch.from_numpy(sv),
+        torch.from_numpy(mm),
+        torch.from_numpy(uu),
+        torch.from_numpy(y),
+        ids
+    )
+
+def build_samples(news_json, hd_json, encoder, use_ic=True, use_cc=True, use_fc=True):
+    by_news = defaultdict(list)
+    for item_k, v in hd_json.items():
+        nid = str(v.get("news_id"))
+        if nid and nid in news_json:
+            by_news[nid].append(item_k)
+
+    samples = []
+    for nid, news in news_json.items():
+        if nid not in by_news:
+            continue
+        item_k = by_news[nid][0]
+        hd = hd_json[item_k]
+        sents = sent_split(str(news.get("content","")))
+        S = len(sents)
+
+        m = np.zeros((S,), dtype=np.float32)
+        u = np.zeros((S,), dtype=np.float32)
+
+        if use_ic:
+            posX1 = hd.get("IC",{}).get("posX_1",[])
+            for p in posX1:
+                if 0<=p<S: m[p]=1; u[p]+=1
+        if use_cc:
+            posT2 = hd.get("CC",{}).get("posT_2",[])
+            for _ in posT2:
+                if S>0:
+                    idx = min(S-1, max(0, S//2))
+                    m[idx]=1; u[idx]+=1
+        if use_fc:
+            posT3 = hd.get("FC",{}).get("posT_3",[])
+            for _ in posT3:
+                if S>0:
+                    idx = min(S-1, max(0, S//3))
+                    m[idx]=1; u[idx]+=1
+
+        vecs = sbert(encoder, sents) if S>0 else np.zeros((0, encoder.get_sentence_embedding_dimension()))
+        label = int(news.get("label", 0))
+        samples.append(Sample(nid, sents, label, m, u, vecs))
+    return samples
+
+def stratified_split(samples, seed=42, ratio=(0.6,0.2,0.2)):
+    rnd = random.Random(seed)
+    buckets = defaultdict(list)
+    for s in samples:
+        buckets[int(s.label)].append(s)
+    train=[]; val=[]; test=[]
+    for _, arr in buckets.items():
+        rnd.shuffle(arr)
+        n=len(arr); n_tr=int(n*ratio[0]); n_va=int(n*ratio[1])
+        train+=arr[:n_tr]
+        val  +=arr[n_tr:n_tr+n_va]
+        test +=arr[n_tr+n_va:]
+    rnd.shuffle(train); rnd.shuffle(val); rnd.shuffle(test)
+    return train, val, test
+
+def run_epoch(model, loader, optim=None, device="cpu"):
+    is_train = optim is not None
+    model.train() if is_train else model.eval()
+    losses=[]; ys=[]; ps=[]
+    bce = nn.BCEWithLogitsLoss()
+    with torch.set_grad_enabled(is_train):
+        for sv, mm, uu, y, _ in loader:
+            sv=sv.to(device); mm=mm.to(device); uu=uu.to(device); y=y.to(device)
+            logit, _ = model(sv.float(), mm.float(), uu.float())
+            loss = bce(logit, y)
+            if is_train:
+                optim.zero_grad(); loss.backward(); optim.step()
+            losses.append(loss.item())
+            ys.append(y.detach().cpu().numpy())
+            ps.append(torch.sigmoid(logit).detach().cpu().numpy())
+    y = np.concatenate(ys); p = np.concatenate(ps)
+    pred = (p>=0.5).astype(int)
+    acc = accuracy_score(y, pred)
+    pre, rec, f1, _ = precision_recall_fscore_support(y, pred, average="binary", zero_division=0)
+    return np.mean(losses), acc, pre, rec, f1, y, pred
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--news_json", required=True)
+    ap.add_argument("--hd_json",   required=True)
+    ap.add_argument("--encoder_dir", required=True)
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out_pred", default="")
+    ap.add_argument("--out_cm",   default="")
+    args = ap.parse_args()
+
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+
+    news = load_news_json(args.news_json)
+    hd   = load_hd_json(args.hd_json)
+    enc  = get_encoder(args.encoder_dir)
+
+    samples = build_samples(news, hd, enc, use_ic=True, use_cc=True, use_fc=True)
+    train, val, test = stratified_split(samples, seed=args.seed, ratio=(0.6,0.2,0.2))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = HDFEClassifier(d_in=enc.get_sentence_embedding_dimension(), d_proj=256).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    tr_loader = DataLoader(WeiboFNDataset(train), batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    va_loader = DataLoader(WeiboFNDataset(val),   batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    te_loader = DataLoader(WeiboFNDataset(test),  batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+
+    best_f1 = -1; patience=3; bad=0; best_state=None
+    for ep in range(1, args.epochs+1):
+        tl, ta, tp, trc, tf1, _, _ = run_epoch(model, tr_loader, opt, device)
+        vl, va, vp, vrc, vf1, _, _ = run_epoch(model, va_loader, None, device)
+        print(f"[ep {ep}] train loss {tl:.4f} acc {ta:.3f} F1 {tf1:.3f} | val loss {vl:.4f} acc {va:.3f} F1 {vf1:.3f}")
+        if vf1 > best_f1:
+            best_f1 = vf1; bad=0; best_state = {k:v.cpu() for k,v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience: break
+
+    if best_state: model.load_state_dict(best_state)
+
+    l, a, p, r, f1, y_true, y_pred = run_epoch(model, te_loader, None, device)
+    print(f"[test] loss {l:.4f} acc {a:.3f} pre {p:.3f} rec {r:.3f} f1 {f1:.3f}")
+
+    cm = confusion_matrix(y_true.astype(int), y_pred.astype(int), labels=[0,1])
+    cm_dict = {
+        "labels": ["real(0)", "fake(1)"],
+        "matrix": cm.tolist(),
+        "TN": int(cm[0,0]), "FP": int(cm[0,1]),
+        "FN": int(cm[1,0]), "TP": int(cm[1,1])
+    }
+
+    os.makedirs(os.path.dirname(args.out_pred), exist_ok=True)
+    with open(args.out_pred, "w", encoding="utf-8") as fw:
+        model.eval()
+        for sv, mm, uu, y, ids in te_loader:
+            sv=sv.to(device); mm=mm.to(device); uu=uu.to(device)
+            logit, w = model(sv.float(), mm.float(), uu.float())
+            prob = torch.sigmoid(logit).detach().cpu().numpy().tolist()
+            attn = w.detach().cpu().numpy().tolist()
+            for i, nid in enumerate(ids):
+                fw.write(json.dumps({
+                    "news_id": nid,
+                    "prob_fake": prob[i],
+                    "label": int(y[i].item()),
+                    "attn": attn[i]
+                }, ensure_ascii=False) + "\n")
+
+    with open(args.out_cm, "w", encoding="utf-8") as fcm:
+        json.dump(cm_dict, fcm, ensure_ascii=False, indent=2)
+    print(f"[OK] predictions -> {args.out_pred}")
+    print(f"[OK] confusion matrix -> {args.out_cm}")
+
+if __name__ == "__main__":
+    main()
