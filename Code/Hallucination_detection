@@ -1,0 +1,361 @@
+import os
+import re
+from tqdm import tqdm
+import time
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from collections import defaultdict
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.optimize import linear_sum_assignment
+import jieba
+import jieba.posseg as pseg
+from sentence_transformers import SentenceTransformer
+
+
+ITEMS_JSON = ""
+NEWS_JSON = ""
+MAP_JSON_CANDIDATE = ""
+OUT_JSON = ""
+
+
+ZH_SPLIT_RE = re.compile(r'[。！？!?；;]\s*')
+ITEM_RE = re.compile(r'^item_\d+$')
+
+def sent_split(text: str) -> List[str]:
+    return [s.strip() for s in ZH_SPLIT_RE.split(text or "") if s.strip()]
+
+def get_encoder(name="paraphrase-multilingual-MiniLM-L12-v2"):
+    return SentenceTransformer(name)
+
+def sbert(model, texts: List[str]) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, model.get_sentence_embedding_dimension()))
+    return np.asarray(model.encode(texts, normalize_embeddings=True, show_progress_bar=False))
+
+def cos(a: np.ndarray, b: np.ndarray) -> float:
+    if a.ndim == 1: a = a[None, :]
+    if b.ndim == 1: b = b[None, :]
+    return float((a @ b.T)[0,0])
+
+
+@dataclass
+class Event:
+    s: str; v: str; o: str
+
+def extract_event(sentence: str) -> Event:
+    words = list(pseg.cut(sentence))
+    v, vidx = '', -1
+    for i, w in enumerate(words):
+        if w.flag.startswith('v'):
+            v, vidx = w.word, i; break
+    s = ''
+    for i in range(vidx-1, -1, -1):
+        if words[i].flag.startswith(('n','r','nr','ns','nt','nz')):
+            s = words[i].word; break
+    o = ''
+    for i in range(vidx+1, len(words)):
+        if words[i].flag.startswith('n'):
+            o = words[i].word; break
+    return Event(s or '', v or '', o or '')
+
+def batch_events(sents: List[str]) -> List[Event]:
+    return [extract_event(s) for s in sents]
+
+
+class ICDetector:
+    def __init__(self, enc, phi1=0.62, tau=0.7):
+        self.enc = enc
+        self.slots = ['s','v','o']
+        self.phi1 = phi1
+        self.tau = tau
+
+    def _slot_vecs(self, evs: List[Event]) -> Dict[str, np.ndarray]:
+        return {k: sbert(self.enc, [getattr(e,k) or '' for e in evs]) for k in self.slots}
+
+    def _alpha(self, Xs: Dict[str,np.ndarray], Ts: Dict[str,np.ndarray]) -> Dict[str,float]:
+        # 逆方差权重
+        vars_ = {}
+        for k in self.slots:
+            A, B = Xs[k], Ts[k]
+            if len(A)==0 or len(B)==0:
+                vars_[k] = 1.0
+            else:
+                n = min(len(A), len(B), 16)
+                ia = np.random.choice(len(A), n, replace=False)
+                ib = np.random.choice(len(B), n, replace=False)
+                sims = np.sum(A[ia]*B[ib], axis=1)
+                vars_[k] = np.var(sims) + 1e-6
+        inv = {k: 1.0/v for k,v in vars_.items()}
+        Z = sum(inv.values())
+        return {k: inv[k]/Z for k in self.slots}
+
+    def run(self, news_text: str, item_text: str):
+        X = sent_split(news_text); T = sent_split(item_text)
+        Xev, Tev = batch_events(X), batch_events(T)
+        if not Xev or not Tev:
+            return {"posX_1": [], "posT_1": [], "pairs": [], "X_sents": X, "T_sents": T}
+
+        Xs, Ts = self._slot_vecs(Xev), self._slot_vecs(Tev)
+        alpha = self._alpha(Xs, Ts)
+
+        m, n = len(Xev), len(Tev)
+        A = np.zeros((m,n))
+        for i in range(m):
+            for j in range(n):
+                sim = 0.0
+                for r in self.slots:
+                    sim += alpha[r] * float(np.dot(Xs[r][i], Ts[r][j]))
+                A[i,j] = sim / len(self.slots)
+
+        k = max(m,n)
+        Ap = -1.0 * np.ones((k,k))
+        Ap[:m,:n] = A
+        cost = 1.0 - ((Ap + 1.0)/2.0)
+        rows, cols = linear_sum_assignment(cost)
+
+        pairs=[]
+        for r,c in zip(rows, cols):
+            if r<m and c<n and A[r,c] > self.phi1:
+                pairs.append((r,c,float(A[r,c])))
+
+        posX, posT = set(), set()
+        for (i,j,_) in pairs:
+            inc=[]
+            for r in self.slots:
+                a = getattr(Xev[i], r) or ''
+                b = getattr(Tev[j], r) or ''
+                if not a or not b:
+                    inc.append(0)
+                else:
+                    sim = cos(sbert(self.enc,[a])[0], sbert(self.enc,[b])[0])
+                    inc.append(0 if sim >= self.tau else 1)
+            s_mis, v_mis, o_mis = inc[0], inc[1], inc[2]
+            trigger = ((s_mis ^ o_mis)==1) or ((not s_mis and not o_mis) and v_mis)
+            if trigger:
+                posX.add(i); posT.add(j)
+
+        return {"posX_1": sorted(posX), "posT_1": sorted(posT), "pairs": pairs,
+                "X_sents": X, "T_sents": T}
+
+
+class CCDetector:
+    def __init__(self, enc, phi3=0.65, phi4=3):
+        self.enc = enc
+        self.phi3 = phi3
+        self.phi4 = phi4
+
+    def _subject(self, sent: str) -> str:
+        for w, flag in pseg.cut(sent):
+            if flag.startswith(('n','nr','ns','nt','nz','r')):
+                return w
+        return "UNK"
+
+    def run(self, text: str):
+        T = sent_split(text)
+        if not T:
+            return {"posT_2": [], "tracks": [], "T_sents": []}
+        sbjs = [self._subject(s) for s in T]
+        emb  = sbert(self.enc, T)
+
+        buckets = defaultdict(list)
+        for idx, s in enumerate(sbjs):
+            buckets[s].append(idx)
+
+        pos=set(); tracks=[]
+        for s, idxs in buckets.items():
+            if len(idxs)<=1:
+                continue
+            drifts = [1.0 - float(np.dot(emb[idxs[k]], emb[idxs[k-1]])) for k in range(1,len(idxs))]
+            V_topic = float(np.mean(drifts)) if drifts else 0.0
+            V_gap = 0
+            for k in range(len(idxs)-1):
+                V_gap = max(V_gap, idxs[k+1]-idxs[k]-1)
+            trigger = (V_topic > self.phi3) or (V_gap > self.phi4)
+            tracks.append({"subject": s, "V_topic": V_topic, "V_gap": V_gap, "idxs": idxs})
+            if trigger:
+                for j in idxs: pos.add(j)
+        return {"posT_2": sorted(pos), "tracks": tracks, "T_sents": T}
+
+
+@dataclass
+class Triple:
+    s: str; v: str; o: str
+
+def triple_from_sent(s: str) -> Triple:
+    ev = extract_event(s)
+    return Triple(ev.s, ev.v, ev.o)
+
+class FCDetector:
+    def __init__(self, enc, K1=6, K2=10, contradiction_ratio=0.5):
+        self.enc = enc
+        self.K1, self.K2 = K1, K2
+        self.ratio = contradiction_ratio
+
+    def _evidence_from_comments(self, cmts: List[str]) -> List[Triple]:
+        if not cmts: return []
+        vec = sbert(self.enc, cmts)
+        k = min(self.K1, len(cmts))
+        km = KMeans(n_clusters=k, n_init=10, random_state=42)
+        labels = km.fit_predict(vec)
+        chosen=[]
+        for c in range(k):
+            idxs = np.where(labels==c)[0]
+            centroid = km.cluster_centers_[c].reshape(1,-1)
+            best = idxs[np.argmax(cosine_similarity(vec[idxs], centroid))]
+            chosen.append(cmts[best])
+        return [triple_from_sent(x) for x in chosen]
+
+    def run(self, text: str, comments: Optional[List[str]]=None):
+        T = sent_split(text)
+        claims = [triple_from_sent(s) for s in T]
+        evid   = self._evidence_from_comments(comments or [])
+
+        pos=[]; details=[]
+        for j, c in enumerate(claims):
+            if not (c.s or c.v or c.o):
+                details.append({"t_index": j, "support": 0, "contradict": 0, "ratio": 0.0, "note": "no triple"})
+                continue
+            paths = [e for e in evid if (e.s==c.s or e.o==c.o or (e.s==c.s and e.o==c.o))]
+            if not paths:
+                details.append({"t_index": j, "support": 0, "contradict": 0, "ratio": 0.0, "note": "no evidence"})
+                continue
+            c_v = sbert(self.enc, [c.v or ""])[0]
+            p_v = sbert(self.enc, [p.v or "" for p in paths])
+            sims = (p_v @ c_v).tolist()
+            ranked = sorted(zip(paths, sims), key=lambda x: -x[1])[:min(self.K2, len(paths))]
+            contradict = sum(1 for _, s in ranked if s < 0)
+            support    = len(ranked) - contradict
+            ratio = (contradict / len(ranked)) if ranked else 0.0
+            details.append({"t_index": j, "support": support, "contradict": contradict, "ratio": ratio})
+            if ranked and ratio >= self.ratio:
+                pos.append(j)
+        return {"posT_3": sorted(set(pos)), "evidence": details, "T_sents": T}
+
+
+def load_items_json(path: str) -> Dict[str, str]:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    items = {}
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if ITEM_RE.match(str(k)) and isinstance(v, str):
+                items[str(k)] = v
+    elif isinstance(obj, list):
+        for row in obj:
+            if isinstance(row, dict):
+                for k,v in row.items():
+                    if ITEM_RE.match(str(k)) and isinstance(v, str):
+                        items[str(k)] = v
+    if not items:
+        raise ValueError("items_json 中未找到任何 item_*。")
+    return items
+
+def load_news_json(path: str) -> Dict[str, dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError("news_json 顶层应为 dict（键为新闻ID）。")
+    return obj
+
+def load_map_json_if_exists(path: str) -> Dict[str, str]:
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return {str(k): str(v) for k,v in obj.items()}
+    return {}
+
+def auto_align_items_to_news(enc, items: Dict[str,str], news: Dict[str,dict]) -> Dict[str,str]:
+    item_keys = sorted(items.keys(), key=lambda x: int(x.split('_')[-1]))
+    item_texts = [items[k] for k in item_keys]
+    news_keys  = list(news.keys())
+    news_texts = [str(news[k].get("content","")) for k in news_keys]
+    Ei = sbert(enc, item_texts)
+    En = sbert(enc, news_texts)
+    if len(Ei)==0 or len(En)==0:
+        return {}
+    S = Ei @ En.T
+    m, n = S.shape
+    K = max(m, n)
+    M = np.zeros((K,K)) - 1.0
+    M[:m,:n] = S
+    cost = 1.0 - ((M + 1.0)/2.0)
+    rows, cols = linear_sum_assignment(cost)
+    mapping = {}
+    for r,c in zip(rows, cols):
+        if r<m and c<n:
+            mapping[item_keys[r]] = news_keys[c]
+    return mapping
+
+def get_en(path=None):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if path is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.abspath(os.path.join(here, "Model", "sentence_bert"))
+    if not os.path.isdir(path):
+        print("[INFO] 未找到本地模型，尝试在线下载...")
+        model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", show_progress_bar=True)
+        return model
+    else:
+        files = list(os.listdir(path))
+        print(f"[INFO] 正在加载本地模型: {path}")
+        for _ in tqdm(files, desc="Loading local model files"):
+            time.sleep(0.05)  # 模拟加载每个文件的耗时
+        model = SentenceTransformer(path, device='cpu')  # 也可用 'cuda'
+        return model
+
+def main():
+    items = load_items_json(ITEMS_JSON)
+    news  = load_news_json(NEWS_JSON)
+    mapping = load_map_json_if_exists(MAP_JSON_CANDIDATE)
+
+    enc = get_en(r"E:\InS-LLM\Model\sentence_bert")
+    ic = ICDetector(enc, phi1=0.62, tau=0.7)
+    cc = CCDetector(enc, phi3=0.65, phi4=3)
+    fc = FCDetector(enc, K1=6, K2=10, contradiction_ratio=0.5)
+
+
+    if not mapping:
+        mapping = auto_align_items_to_news(enc, items, news)
+
+    results = {}
+    for item_key in sorted(items.keys(), key=lambda x: int(x.split('_')[-1])):
+        item_text = items[item_key]
+
+
+        cc_res = cc.run(item_text)
+
+
+        news_id = mapping.get(item_key)
+        news_obj = news.get(str(news_id)) if news_id is not None else None
+
+
+        comments = []
+        if isinstance(news_obj, dict) and isinstance(news_obj.get("comments"), list):
+            comments = [str(x) for x in news_obj["comments"]]
+        fc_res = fc.run(item_text, comments)
+
+
+        if isinstance(news_obj, dict) and isinstance(news_obj.get("content"), str):
+            ic_res = ic.run(news_obj["content"], item_text)
+        else:
+            ic_res = {"posX_1": [], "posT_1": [], "pairs": [], "X_sents": [], "T_sents": sent_split(item_text)}
+
+        results[item_key] = {
+            "news_id": news_id if news_id is not None else None,
+            "IC": ic_res,
+            "CC": cc_res,
+            "FC": fc_res
+        }
+
+    os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
+    with open(OUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"[OK] 写出结果 -> {OUT_JSON}")
+
+if __name__ == "__main__":
+    main()
