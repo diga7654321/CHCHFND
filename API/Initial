@@ -1,1 +1,55 @@
+from openai import OpenAI
+import os
+import json
 
+OPENAI_KEY  = os.getenv("")
+OPENAI_BASE = os.getenv("")
+MODEL_NAME  = os.getenv("")
+client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
+
+
+def load_news_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("")
+    return data
+
+
+def build_initial_analysis_prompt(claim: str) -> str:
+    return f"""
+"""
+
+
+def call_llm_for_initial_analysis(claim: str) -> str:
+    prompt = build_initial_analysis_prompt(claim)
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": ""},
+            {"role": "user", "content": prompt}
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+if __name__ == "__main__":
+    news_file   = ""
+    output_file = ""
+
+    news_data = load_news_json(news_file)
+
+    results = {}
+    for item in news_data:
+        event_id = str(item.get("event_id"))
+        claim    = item.get("claim", "")
+
+        out_text = call_llm_for_initial_analysis(claim)
+        results[f"item_{event_id}"] = out_text
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK]  -> {output_file}")
