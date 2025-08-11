@@ -1,0 +1,115 @@
+from openai import OpenAI
+import os, json, re, time
+
+
+OPENAI_KEY  = os.getenv("")
+OPENAI_BASE = os.getenv("")
+MODEL_NAME  = os.getenv("")
+client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
+
+
+def load_news_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("news file must be a list[dict]")
+    return data
+
+def load_llm_outputs(path: str):
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError("initial outputs must be a dict {item_<id>: text}")
+    return obj
+
+def load_detection_results(path: str):
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError("detection results must be a dict")
+    return obj
+
+
+def render_detection_context(item_key: str, det_map: dict) -> str:
+    det = det_map.get(item_key)
+    if det is None:
+        return "None"
+    if isinstance(det, str):
+        return det.strip() or "None"
+    ic = det.get("IC", {})
+    cc = det.get("CC", {})
+    fc = det.get("FC", {})
+    parts = []
+    if ic:
+        x1 = ic.get("posX_1", [])
+        t1 = ic.get("posT_1", [])
+        pairs = ic.get("pairs", [])
+        parts.append(f"IC: posX_1={len(x1)}, posT_1={len(t1)}, aligned_pairs={len(pairs)}")
+    if cc:
+        t2 = cc.get("posT_2", [])
+        parts.append(f"CC: posT_2={len(t2)}")
+    if fc:
+        t3 = fc.get("posT_3", [])
+        parts.append(f"FC: posT_3={len(t3)}")
+    info = "; ".join(parts) if parts else "None"
+    return info
+
+
+def build_single_correction_prompt(claim: str, previous_output: str, detection_context: str) -> str:
+    return f"""
+
+{claim}
+
+
+{previous_output}
+
+
+{detection_context}
+
+
+"""
+
+
+def call_llm_single_correction(claim: str, prev_text: str, det_ctx: str) -> str:
+    prompt = build_single_correction_prompt(claim, prev_text, det_ctx)
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0.2,
+        messages=[
+            {"role":"system","content":"You are a careful rumor detection expert."},
+            {"role":"user","content": prompt}
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+if __name__ == "__main__":
+    news_file             = ""   
+    initial_outputs_file  = ""   
+    detection_results_file= ""   
+    corrected_outputs     = ""  
+
+    news_list = load_news_json(news_file)
+    init_map  = load_llm_outputs(initial_outputs_file)
+    det_map   = load_detection_results(detection_results_file)
+
+    results = {}
+    for row in news_list:
+        eid   = str(row.get("event_id"))
+        claim = str(row.get("claim", "")).strip()
+        key   = f"item_{eid}"
+        prev  = (init_map.get(key) or "").strip()
+        if not claim or not prev:
+            continue
+        det_ctx = render_detection_context(key, det_map)
+        corrected = call_llm_single_correction(claim, prev, det_ctx)
+        results[key] = corrected
+
+    os.makedirs(os.path.dirname(corrected_outputs), exist_ok=True)
+    with open(corrected_outputs, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] single-round corrections -> {corrected_outputs}")
